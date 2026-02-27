@@ -3,7 +3,6 @@
 *.keras
 wandb/
 images/ 
-models/
 API_KEY.txt
 
 .qodo
