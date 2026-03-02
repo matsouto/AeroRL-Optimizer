@@ -2,6 +2,7 @@
 *.gif
 *.keras
 wandb/
+logs/
 images/ 
 API_KEY.txt
 
