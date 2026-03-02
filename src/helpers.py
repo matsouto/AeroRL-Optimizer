@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.special import comb
+from typing import Optional
 
 
 def eng_string(
@@ -7,7 +8,7 @@ def eng_string(
     unit: str = "",
     format="%.3g",
     si=True,
-    add_space_after_number: bool = None,
+    add_space_after_number: Optional[bool] = None,
 ) -> str:
     """
     Taken from: https://stackoverflow.com/questions/17973278/python-decimal-engineering-notation-for-mili-10e-3-and-micro-10e-6/40691220
