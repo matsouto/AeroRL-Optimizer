@@ -3,7 +3,7 @@ import numpy as np
 from unittest.mock import Mock, patch
 from gymnasium import spaces
 
-from src.env.static_opt_env import StaticOptEnv
+from src.enviroments.static_opt_env import StaticOptEnv
 
 
 class TestStaticOptEnvBase(unittest.TestCase):
