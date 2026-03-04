@@ -1,5 +1,3 @@
-# TESTAR AGORA NO SKETCH E DEPOIS RODAR O TREINAMENTO DE VERDAEDE
-
 import joblib
 import gymnasium as gym
 import numpy as np
@@ -29,6 +27,7 @@ class StaticOptEnv(gym.Env):
         n_alphas: int = 40,
         lower_alpha: float = -5.0,
         upper_alpha: float = 15.0,
+        render_mode: str = None,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -40,6 +39,7 @@ class StaticOptEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.scaler_path = scaler_path
         self.decoder_path = decoder_path
+        self.render_mode = render_mode
 
         # Initialize the current latent vector and coefficients to default values
         self._current_z = np.zeros(self.latent_dim, dtype=np.float32)
@@ -105,6 +105,21 @@ class StaticOptEnv(gym.Env):
 
         return coords
 
+    def _get_airfoil_characteristics(self, x_coords, y_coords):
+        """Extract physical characteristics of the airfoil from coordinates."""
+        # Maximum thickness (as percentage of chord)
+        max_thickness = np.max(np.abs(y_coords)) * 100
+
+        # Camber: average y value (indication of camber)
+        camber = np.mean(y_coords) * 100
+
+        # Leading edge radius (approximate)
+        le_radius = np.sqrt(
+            (x_coords[1] - x_coords[0]) ** 2 + (y_coords[1] - y_coords[0]) ** 2
+        )
+
+        return max_thickness, camber, le_radius
+
     def step(self, action):
         self._current_step += 1
 
@@ -130,28 +145,42 @@ class StaticOptEnv(gym.Env):
 
             self._current_cl_sweep = aero["CL"]
             self._current_cd_sweep = aero["CD"]
-            confidence_sweep = aero["analysis_confidence"]
+            confidence = aero["analysis_confidence"]
 
-            # MÁSCARA DE SEGURANÇA MÍNIMA:
-            valid_mask = confidence_sweep >= 0.30
+            valid_mask = confidence >= 0.30
 
             if not np.any(valid_mask):
-                # Se o perfil é tão ruim que não tem 1 ângulo confiável
-                self._current_efficiency = -20.0
-                reward = -20.0
+                reward = -1.0  # Penalidade fixa e pequena
+                self._current_efficiency = 0.0
             else:
-                # Usa a eficiência BRUTA (sem penalidades) para os pontos válidos
                 valid_cl = self._current_cl_sweep[valid_mask]
                 valid_cd = self._current_cd_sweep[valid_mask]
 
-                self._current_efficiency = float(np.max(valid_cl / valid_cd))
-                reward = self._current_efficiency
+                # 1. Proteção contra divisão por zero/valores ínfimos
+                # Um CD menor que 0.001 é raríssimo em condições reais
+                safe_cd = np.maximum(valid_cd, 0.005)
+
+                # 2. Cálculo da eficiência com Teto (Clipping)
+                # Mesmo o melhor aerofólio do mundo dificilmente passa de 200
+                eff_sweep = valid_cl / safe_cd
+                raw_eff = float(np.max(eff_sweep))
+                self._current_efficiency = np.clip(raw_eff, 0, 250)
+
+                # Calcula a espessura máxima aproximada (diferença entre Y máximo e mínimo)
+                thickness = np.max(coords[:, 1]) - np.min(coords[:, 1])
+                thickness_penalty = 0.0
+
+                # Se for mais fino que 10% da corda, aplique uma punição progressiva
+                if thickness < 0.10:
+                    thickness_penalty = (
+                        0.10 - thickness
+                    ) * 50.0  # Ajuste o peso conforme necessário
+
+                self.reward = (self._current_efficiency - thickness_penalty) / 100.0
 
         except Exception as e:
-            self._current_cl_sweep = np.zeros(self.n_alphas)
-            self._current_cd_sweep = np.zeros(self.n_alphas)
-            self._current_efficiency = -50.0
-            reward = -50.0
+            reward = -2.0
+            self._current_efficiency = 0.0
 
         terminated = False
         truncated = self._current_step >= self.max_episode_steps
@@ -179,31 +208,91 @@ class StaticOptEnv(gym.Env):
         coords = self._get_coords()
         x_coords, y_coords = coords[:, 0], coords[:, 1]
 
-        # 2. Configurar o modo interativo do Matplotlib (para não travar o loop)
+        # Get airfoil characteristics
+        max_thickness, camber, le_radius = self._get_airfoil_characteristics(
+            x_coords, y_coords
+        )
+
+        # 1. Configurar o modo interativo
         plt.ion()
 
-        # 3. Limpar o frame anterior para desenhar o novo
+        # Se a figura não existir, cria uma com proporção retangular (mais larga)
+        if not plt.fignum_exists(1):
+            plt.figure(1, figsize=(12, 5))
+
+        # 2. Limpar o frame anterior
         plt.clf()
 
-        # 4. Desenhar o aerofólio
+        # ==========================================
+        # SUBPLOT 1: A GEOMETRIA DO AEROFÓLIO
+        # ==========================================
+        plt.subplot(1, 2, 1)
         plt.plot(x_coords, y_coords, color="blue", linewidth=2)
         plt.fill(x_coords, y_coords, color="blue", alpha=0.15)
 
-        # 5. Formatação do Gráfico para ficar com cara de software profissional
-        # Exibe a eficiência na tela em tempo real
         plt.title(
-            f"Otimização em Andamento | Eficiência (L/D) Máx: {self._current_efficiency:.2f}"
+            f"Airfoil | Thickness: {max_thickness:.2f}% | Camber: {camber:.3f}% | LE Radius: {le_radius:.4f}"
         )
         plt.xlabel("Corda (X)")
         plt.ylabel("Espessura (Y)")
         plt.grid(True, linestyle="--", alpha=0.6)
 
-        # Travar os eixos é CRÍTICO para a animação não ficar pulando
+        # Travar os eixos para não pular
         plt.axis("equal")
         plt.xlim(-0.05, 1.05)
         plt.ylim(-0.25, 0.25)
 
-        # Atualiza a tela rapidamente (10 milissegundos) e devolve o controle ao script
+        # ==========================================
+        # SUBPLOT 2: A POLAR AERODINÂMICA (Eficiência vs Alpha)
+        # ==========================================
+        plt.subplot(1, 2, 2)
+
+        # Recria o vetor de alphas usado no step()
+        # Ajuste self.lower_alpha, self.upper_alpha e self.n_alphas se os nomes forem diferentes no seu __init__
+        alphas = np.linspace(self.lower_alpha, self.upper_alpha, self.n_alphas)
+
+        # Calcula a eficiência para toda a curva (evitando divisão por zero)
+        valid_cd = np.where(self._current_cd_sweep > 1e-5, self._current_cd_sweep, 1e-5)
+        efficiency_sweep = self._current_cl_sweep / valid_cd
+
+        # Plota a curva completa
+        plt.plot(
+            alphas, efficiency_sweep, color="green", linewidth=2, label="L/D Curve"
+        )
+
+        # Encontra e marca o ponto de eficiência máxima
+        max_idx = np.argmax(efficiency_sweep)
+        max_alpha = alphas[max_idx]
+        max_eff = efficiency_sweep[max_idx]
+
+        plt.plot(
+            max_alpha,
+            max_eff,
+            "ro",
+            markersize=8,
+            label=f"Máx L/D: {max_eff:.1f} @ {max_alpha:.1f}°",
+        )
+
+        # Calculate latent distance for display
+        latent_distance = np.linalg.norm(self._current_z)
+
+        plt.title(
+            f"Performance | L/D: {self._current_efficiency:.2f} | Latent Dist: {latent_distance:.3f}"
+        )
+        plt.xlabel("Ângulo de Ataque (Graus)")
+        plt.ylabel("Eficiência (L/D)")
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend(loc="upper right")
+
+        # Travar os eixos da polar é CRÍTICO.
+        # Ajuste o ylim superior (ex: 150) dependendo do máximo que seus perfis costumam atingir
+        plt.xlim(self.lower_alpha, self.upper_alpha)
+        plt.ylim(0, 150)
+
+        # ==========================================
+        # ATUALIZAÇÃO DA TELA
+        # ==========================================
+        plt.tight_layout()  # Evita que os gráficos fiquem sobrepostos
         plt.pause(0.01)
 
     def close(self):
