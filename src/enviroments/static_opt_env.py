@@ -106,19 +106,32 @@ class StaticOptEnv(gym.Env):
         return coords
 
     def _get_airfoil_characteristics(self, x_coords, y_coords):
-        """Extract physical characteristics of the airfoil from coordinates."""
-        # Maximum thickness (as percentage of chord)
-        max_thickness = np.max(np.abs(y_coords)) * 100
+        # 1. Normalize by Chord (Assumes LE is at 0 and TE is at max X)
+        chord = np.max(x_coords) - np.min(x_coords)
+        xn = x_coords / chord
+        yn = y_coords / chord
 
-        # Camber: average y value (indication of camber)
-        camber = np.mean(y_coords) * 100
+        # 2. Split into Upper and Lower (Requires points to be ordered LE -> TE)
+        # This is a simplified split; professional tools use interp1d to align X-stations
+        half = len(xn) // 2
+        y_upper = yn[:half]
+        y_lower = yn[half:]
 
-        # Leading edge radius (approximate)
-        le_radius = np.sqrt(
-            (x_coords[1] - x_coords[0]) ** 2 + (y_coords[1] - y_coords[0]) ** 2
-        )
+        # 3. Correct Thickness & Camber Logic
+        # We use the absolute difference between surfaces at the same X-stations
+        thickness_dist = np.abs(y_upper - y_lower)
+        max_thickness = np.max(thickness_dist) * 100  # % of chord
 
-        return max_thickness, camber, le_radius
+        # Camber line is the average of upper and lower surfaces
+        camber_line = (y_upper + y_lower) / 2
+        max_camber = np.max(np.abs(camber_line)) * 100  # % of chord
+
+        # 4. LE Radius (Parabolic fit approximation)
+        # A better approx uses the second derivative at the nose
+        # For now, let's just fix your distance logic to be more descriptive
+        le_step_size = np.sqrt((xn[1] - xn[0]) ** 2 + (yn[1] - yn[0]) ** 2)
+
+        return max_thickness, max_camber, le_step_size
 
     def step(self, action):
         self._current_step += 1
@@ -167,14 +180,20 @@ class StaticOptEnv(gym.Env):
                 self._current_efficiency = np.clip(raw_eff, 0, 250)
 
                 # Calcula a espessura máxima aproximada (diferença entre Y máximo e mínimo)
-                thickness = np.max(coords[:, 1]) - np.min(coords[:, 1])
+                coords = self._get_coords()
+                x_coords, y_coords = coords[:, 0], coords[:, 1]
+                max_thickness, _, _ = self._get_airfoil_characteristics(
+                    x_coords, y_coords
+                )
+                max_thickness_float = max_thickness / 100.0
+
                 thickness_penalty = 0.0
 
-                # Se for mais fino que 10% da corda, aplique uma punição progressiva
-                if thickness < 0.10:
-                    thickness_penalty = (
-                        0.10 - thickness
-                    ) * 50.0  # Ajuste o peso conforme necessário
+                # Ensure max_thickness is a float 0.12 (for 12%) or 0.08 (for 8%)
+                if max_thickness_float < 0.10:
+                    diff = 0.10 - max_thickness_float
+                    # Use a squared penalty for a smoother 'soft-wall'
+                    thickness_penalty = (diff**2) * 1000.0
 
                 self.reward = (self._current_efficiency - thickness_penalty) / 100.0
 
