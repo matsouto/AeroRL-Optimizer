@@ -1,3 +1,5 @@
+# TODO: Melhorar prints no terminal
+
 # ============================================================================
 # IMPORTS
 # ============================================================================
@@ -8,21 +10,21 @@ from pathlib import Path
 from wandb.integration.sb3 import WandbCallback
 from stable_baselines3 import PPO, A2C
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList
-from src.enviroments import StaticOptEnv
+from src.enviroments import StaticOptEnv, MultiStageOptEnv
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 # Model and training hyperparameters
-LATENT_DIM = 16
-ACTION_RANGE = 0.1
-LATENT_RANGE = 3.0
 
 ALGORITHM = "PPO"
 POLICY = "MlpPolicy"
-TRAIN_TIMESTEPS = 100000
-EVAL_FREQ = 100
-MAX_EPISODE_STEPS = 100
+TRAIN_TIMESTEPS = 300000
+MAX_EPISODE_STEPS = 50
+LATENT_DIM = 16
+ACTION_RANGE = 0.5
+LATENT_RANGE = 2.0
+EVAL_FREQ = 400
 INFERENCE_EPISODES = 5
 DEV = False  # Set to False to enable Weights & Biases logging
 
@@ -34,6 +36,9 @@ HYPERPARAMETERS = {
     "algorithm": ALGORITHM,
     "policy": POLICY,
     "start_time": TIMESTRING,
+    "latent_dim": LATENT_DIM,
+    "latent_range": LATENT_RANGE,
+    "action_range": ACTION_RANGE,
 }
 
 PROJECT_PATH = Path(__file__).resolve().parent
@@ -77,7 +82,7 @@ TENSORBOARD_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Create three environments: training (no render), evaluation (no render),
 # and rendering (human mode for visualization during inference)
 def make_custom_env(render_mode=None):
-    return StaticOptEnv(
+    return MultiStageOptEnv(
         scaler_path=SCALER_PATH,
         decoder_path=DECODER_PATH,
         latent_dim=LATENT_DIM,
@@ -151,16 +156,48 @@ match ALGORITHM:
     case "A2C":
         model = A2C(**common_params)
 
+# Print training configuration
+print("\n" + "=" * 70)
+print("TRAINING STARTED")
+print("=" * 70)
+print(f"Algorithm: {ALGORITHM}")
+print(f"Policy: {POLICY}")
+print(f"Total Timesteps: {TRAIN_TIMESTEPS:,}")
+print(f"Max Episode Steps: {MAX_EPISODE_STEPS}")
+print(f"Latent Dimension: {LATENT_DIM}")
+print(f"Evaluation Frequency: {EVAL_FREQ}")
+print(f"Model Save Directory: {BEST_MODEL_DIR}")
+print(f"Tensorboard Log Directory: {TENSORBOARD_LOG_DIR}")
+if not DEV:
+    print(f"Weights & Biases: ENABLED")
+else:
+    print(f"Weights & Biases: DISABLED (DEV MODE)")
+print("=" * 70 + "\n")
+
 # Train the model
 model.learn(total_timesteps=TRAIN_TIMESTEPS, callback=callback_list, progress_bar=True)
 
+# Print training completion summary
+print("\n" + "=" * 70)
+print("TRAINING COMPLETED")
+print("=" * 70)
+print(f"Algorithm Used: {ALGORITHM}")
+print(f"Total Timesteps: {TRAIN_TIMESTEPS:,}")
+print(f"Best Model Saved: {BEST_MODEL_DIR / 'best_model.zip'}")
+print(f"Evaluation Logs: {LOGS_OUTPUT_DIR}")
+print(f"Tensorboard Logs: {TENSORBOARD_LOG_DIR}")
 if not DEV:
+    print(f"Weights & Biases Artifacts: {WANDB_DIR}")
     run.finish()
+print("=" * 70 + "\n")
+
+if not DEV:
+    pass  # run.finish() already called above
 
 train_env.close()
 
 # Input so that user can see training results before inference starts
-input()
+input("\n\nTraining complete! Press Enter to start inference and visualization...")
 
 # ============================================================================
 # INFERENCE

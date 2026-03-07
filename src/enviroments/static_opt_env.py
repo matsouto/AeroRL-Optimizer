@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from gymnasium import spaces
 from aerosandbox import Airfoil
+from scipy.interpolate import interp1d
 from src.helpers import cst_to_coords
 
 from src.airfoil import airfoil_modifications
@@ -41,7 +42,7 @@ class StaticOptEnv(gym.Env):
         self.decoder_path = decoder_path
         self.render_mode = render_mode
 
-        # Initialize the current latent vector and coefficients to default values
+        # Initialize latent vector and aerodynamic coefficients
         self._current_z = np.zeros(self.latent_dim, dtype=np.float32)
         self._current_cl_sweep = np.zeros(self.n_alphas, dtype=np.float32)
         self._current_cd_sweep = np.zeros(self.n_alphas, dtype=np.float32)
@@ -51,7 +52,7 @@ class StaticOptEnv(gym.Env):
         # Initialize step counter
         self._current_step = 0
 
-        # The action consists of adjustments to the latent vector
+        # Action space: adjustments to the latent vector
         self.action_space = spaces.Box(
             low=-self.action_range,
             high=self.action_range,
@@ -59,7 +60,7 @@ class StaticOptEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # The observation consists of the current latent vector
+        # Observation space: latent vector
         self.observation_space = spaces.Box(
             low=-self.latent_range,
             high=self.latent_range,
@@ -86,65 +87,37 @@ class StaticOptEnv(gym.Env):
         }
 
     def _get_coords(self):
-        # 4. Rodar Inferência
+        # Run ONNX inference on decoder
         outputs = self.session.run(
             None, {self.input_name: self._current_z.reshape(1, -1)}
         )
 
-        # O ONNX retorna os tensores crus (w_norm e p_norm)
+        # ONNX returns normalized weight and pressure tensors
         w_norm = outputs[0]
         p_norm = outputs[1]
 
-        # 5. Desnormalizar os dados
+        # Denormalize using scaler
         w_phys, p_phys = self.scaler.inverse_transform(w_norm, p_norm)
 
-        # 6. Gerar Coordenadas CST
+        # Generate CST coordinates
         x_coords, y_coords = cst_to_coords(w_phys[0], p_phys[0], n_points=100)
 
         coords = np.stack((x_coords, y_coords), axis=-1)
 
         return coords
 
-    def _get_airfoil_characteristics(self, x_coords, y_coords):
-        # 1. Normalize by Chord (Assumes LE is at 0 and TE is at max X)
-        chord = np.max(x_coords) - np.min(x_coords)
-        xn = x_coords / chord
-        yn = y_coords / chord
-
-        # 2. Split into Upper and Lower (Requires points to be ordered LE -> TE)
-        # This is a simplified split; professional tools use interp1d to align X-stations
-        half = len(xn) // 2
-        y_upper = yn[:half]
-        y_lower = yn[half:]
-
-        # 3. Correct Thickness & Camber Logic
-        # We use the absolute difference between surfaces at the same X-stations
-        thickness_dist = np.abs(y_upper - y_lower)
-        max_thickness = np.max(thickness_dist) * 100  # % of chord
-
-        # Camber line is the average of upper and lower surfaces
-        camber_line = (y_upper + y_lower) / 2
-        max_camber = np.max(np.abs(camber_line)) * 100  # % of chord
-
-        # 4. LE Radius (Parabolic fit approximation)
-        # A better approx uses the second derivative at the nose
-        # For now, let's just fix your distance logic to be more descriptive
-        le_step_size = np.sqrt((xn[1] - xn[0]) ** 2 + (yn[1] - yn[0]) ** 2)
-
-        return max_thickness, max_camber, le_step_size
-
     def step(self, action):
         self._current_step += 1
 
-        # Update the current latent vector based on the action
+        # Update latent vector with action
         self._current_z += action
 
-        # Clip the latent vector to stay within bounds
+        # Clip to stay within valid bounds
         self._current_z = np.clip(
             self._current_z, -self.latent_range, self.latent_range
         )
 
-        # Obter as coordenadas do perfil a partir do decoder
+        # Get airfoil coordinates from decoder
         coords = self._get_coords()
 
         try:
@@ -163,39 +136,33 @@ class StaticOptEnv(gym.Env):
             valid_mask = confidence >= 0.30
 
             if not np.any(valid_mask):
-                reward = -1.0  # Penalidade fixa e pequena
+                reward = -1.0  # Fixed penalty for low confidence
                 self._current_efficiency = 0.0
             else:
                 valid_cl = self._current_cl_sweep[valid_mask]
                 valid_cd = self._current_cd_sweep[valid_mask]
 
-                # 1. Proteção contra divisão por zero/valores ínfimos
-                # Um CD menor que 0.001 é raríssimo em condições reais
+                # Protect against division by zero with minimum CD value
                 safe_cd = np.maximum(valid_cd, 0.005)
 
-                # 2. Cálculo da eficiência com Teto (Clipping)
-                # Mesmo o melhor aerofólio do mundo dificilmente passa de 200
+                # Calculate efficiency with upper bound (even best airfoils rarely exceed 200)
                 eff_sweep = valid_cl / safe_cd
                 raw_eff = float(np.max(eff_sweep))
                 self._current_efficiency = np.clip(raw_eff, 0, 250)
 
-                # Calcula a espessura máxima aproximada (diferença entre Y máximo e mínimo)
+                # Calculate airfoil thickness
                 coords = self._get_coords()
-                x_coords, y_coords = coords[:, 0], coords[:, 1]
-                max_thickness, _, _ = self._get_airfoil_characteristics(
-                    x_coords, y_coords
-                )
-                max_thickness_float = max_thickness / 100.0
+                max_thickness = af.max_thickness()
 
                 thickness_penalty = 0.0
 
-                # Ensure max_thickness is a float 0.12 (for 12%) or 0.08 (for 8%)
-                if max_thickness_float < 0.10:
-                    diff = 0.10 - max_thickness_float
-                    # Use a squared penalty for a smoother 'soft-wall'
+                # Penalty for airfoils too thin (minimum 10% thickness)
+                if max_thickness < 0.10:
+                    diff = 0.10 - max_thickness
+                    # Squared penalty for smooth soft-wall
                     thickness_penalty = (diff**2) * 1000.0
 
-                self.reward = (self._current_efficiency - thickness_penalty) / 100.0
+                reward = (self._current_efficiency - thickness_penalty) / 100.0
 
         except Exception as e:
             reward = -2.0
@@ -227,24 +194,26 @@ class StaticOptEnv(gym.Env):
         coords = self._get_coords()
         x_coords, y_coords = coords[:, 0], coords[:, 1]
 
-        # Get airfoil characteristics
-        max_thickness, camber, le_radius = self._get_airfoil_characteristics(
-            x_coords, y_coords
-        )
+        af = Airfoil(coordinates=coords)
 
-        # 1. Configurar o modo interativo
+        # Get airfoil characteristics
+        max_thickness = af.max_thickness()
+        camber = af.max_camber()
+        le_radius = af.LE_radius()
+
+        # Enable interactive mode
         plt.ion()
 
-        # Se a figura não existir, cria uma com proporção retangular (mais larga)
+        # Create or reuse figure with horizontal aspect ratio
         if not plt.fignum_exists(1):
             plt.figure(1, figsize=(12, 5))
 
-        # 2. Limpar o frame anterior
+        # Clear previous frame
         plt.clf()
 
-        # ==========================================
-        # SUBPLOT 1: A GEOMETRIA DO AEROFÓLIO
-        # ==========================================
+        # ==================================================
+        # Subplot 1: Airfoil geometry
+        # ==================================================
         plt.subplot(1, 2, 1)
         plt.plot(x_coords, y_coords, color="blue", linewidth=2)
         plt.fill(x_coords, y_coords, color="blue", alpha=0.15)
@@ -252,34 +221,33 @@ class StaticOptEnv(gym.Env):
         plt.title(
             f"Airfoil | Thickness: {max_thickness:.2f}% | Camber: {camber:.3f}% | LE Radius: {le_radius:.4f}"
         )
-        plt.xlabel("Corda (X)")
-        plt.ylabel("Espessura (Y)")
+        plt.xlabel("Chord (X)")
+        plt.ylabel("Thickness (Y)")
         plt.grid(True, linestyle="--", alpha=0.6)
 
-        # Travar os eixos para não pular
+        # Lock axes to prevent scaling
         plt.axis("equal")
         plt.xlim(-0.05, 1.05)
         plt.ylim(-0.25, 0.25)
 
-        # ==========================================
-        # SUBPLOT 2: A POLAR AERODINÂMICA (Eficiência vs Alpha)
-        # ==========================================
+        # ==================================================
+        # Subplot 2: Aerodynamic performance (L/D vs AoA)
+        # ==================================================
         plt.subplot(1, 2, 2)
 
-        # Recria o vetor de alphas usado no step()
-        # Ajuste self.lower_alpha, self.upper_alpha e self.n_alphas se os nomes forem diferentes no seu __init__
+        # Recreate angle of attack vector
         alphas = np.linspace(self.lower_alpha, self.upper_alpha, self.n_alphas)
 
-        # Calcula a eficiência para toda a curva (evitando divisão por zero)
+        # Calculate efficiency curve (avoid division by zero)
         valid_cd = np.where(self._current_cd_sweep > 1e-5, self._current_cd_sweep, 1e-5)
         efficiency_sweep = self._current_cl_sweep / valid_cd
 
-        # Plota a curva completa
+        # Plot complete efficiency curve
         plt.plot(
             alphas, efficiency_sweep, color="green", linewidth=2, label="L/D Curve"
         )
 
-        # Encontra e marca o ponto de eficiência máxima
+        # Mark maximum efficiency point
         max_idx = np.argmax(efficiency_sweep)
         max_alpha = alphas[max_idx]
         max_eff = efficiency_sweep[max_idx]
@@ -289,33 +257,31 @@ class StaticOptEnv(gym.Env):
             max_eff,
             "ro",
             markersize=8,
-            label=f"Máx L/D: {max_eff:.1f} @ {max_alpha:.1f}°",
+            label=f"Max L/D: {max_eff:.1f} @ {max_alpha:.1f}°",
         )
 
-        # Calculate latent distance for display
+        # Calculate latent space distance
         latent_distance = np.linalg.norm(self._current_z)
 
         plt.title(
             f"Performance | L/D: {self._current_efficiency:.2f} | Latent Dist: {latent_distance:.3f}"
         )
-        plt.xlabel("Ângulo de Ataque (Graus)")
-        plt.ylabel("Eficiência (L/D)")
+        plt.xlabel("Angle of Attack (degrees)")
+        plt.ylabel("Efficiency (L/D)")
         plt.grid(True, linestyle="--", alpha=0.6)
         plt.legend(loc="upper right")
 
-        # Travar os eixos da polar é CRÍTICO.
-        # Ajuste o ylim superior (ex: 150) dependendo do máximo que seus perfis costumam atingir
+        # Lock polar axes for consistent display
         plt.xlim(self.lower_alpha, self.upper_alpha)
         plt.ylim(0, 150)
 
-        # ==========================================
-        # ATUALIZAÇÃO DA TELA
-        # ==========================================
-        plt.tight_layout()  # Evita que os gráficos fiquem sobrepostos
+        # ==================================================
+        # Update display
+        # ==================================================
+        plt.tight_layout()  # Prevent subplot overlap
         plt.pause(0.01)
 
     def close(self):
-        # Desliga o modo interativo e fecha todas as janelas do matplotlib
-        # Isso impede que o seu computador fique sem RAM após longos testes
+        # Disable interactive mode and close all figures to prevent memory leaks
         plt.ioff()
         plt.close("all")
