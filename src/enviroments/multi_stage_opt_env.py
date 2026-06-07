@@ -26,7 +26,7 @@ class MultiStageOptEnv(gym.Env):
         self,
         scaler_path: str,
         decoder_path: str,
-        latent_dim: int = 16,
+        latent_dim: int = 10,
         action_range: float = 0.1,
         latent_range: float = 3.0,
         max_episode_steps: int = 50,
